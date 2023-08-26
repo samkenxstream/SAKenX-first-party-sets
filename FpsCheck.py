@@ -16,8 +16,10 @@ import requests
 from FpsSet import FpsSet
 from jsonschema import validate
 from urllib.request import urlopen
+from urllib.request import Request
 from publicsuffix2 import PublicSuffixList
 
+WELL_KNOWN = "/.well-known/first-party-set.json"
 
 class FpsCheck:
 
@@ -34,6 +36,7 @@ class FpsCheck:
                 without any given check failing halfway through and not 
                 catching other issues. 
   """
+    
 
     def __init__(self, fps_sites: json, etlds: PublicSuffixList, icanns: set):
         """Stores the input from canonical_sites, effective_tld_names.dat, and 
@@ -45,7 +48,7 @@ class FpsCheck:
         self.icanns = icanns
         self.error_list = []
 
-    def validate_schema(self):
+    def validate_schema(self, schema_file):
         """Validates the canonical sites list
 
         Calls the validate function from the jsonschema package on the input 
@@ -59,7 +62,7 @@ class FpsCheck:
             jsonschema.exceptions.ValidationError if the schema does not match 
             the format stored in SCHEMA 
         """
-        with open('SCHEMA.json') as f:
+        with open(schema_file) as f:
             SCHEMA = json.loads(f.read())
         validate(self.fps_sites, schema = SCHEMA)
 
@@ -74,7 +77,7 @@ class FpsCheck:
         Args:
             None
         Returns:
-            a dictionary of string->FpsSet
+            Dict[string, FpsSet]
         """
         check_sets = {}
         load_sets_errors = []
@@ -102,17 +105,14 @@ class FpsCheck:
         error_list
 
         Args:
-            check_sets: a dictionary of primary->FpsSet
+            Dict[string, FpsSet]
         Returns:
             None
         """
         for fpset in self.fps_sites['sets']:
-            sites = check_sets[fpset.get("primary")].associated_sites
-            service_sites = check_sets[fpset.get("primary")].service_sites
-            if sites:
-                sites = sites + service_sites if service_sites else sites
-            else:
-                sites = service_sites
+            if fpset['primary'] not in  check_sets:
+                continue
+            sites = fpset.get("associatedSites", []) + fpset.get("serviceSites", [])
             rationales = fpset.get('rationaleBySite', None)
             if sites and rationales!=None:
                 for site in sites:
@@ -133,7 +133,7 @@ class FpsCheck:
         added to the error_list.
 
         Args:
-            check_sets: a dictionary of primary->FpsSet
+            check_sets: Dict[string, FpsSet]
         Returns:
             None
         """
@@ -196,7 +196,7 @@ class FpsCheck:
         and appends errors to the error list for any that return false
 
         Args:
-            check_sets: a dictionary of primary->FpsSet
+            check_sets: Dict[string, FpsSet]
         Returns:
             None
         """
@@ -245,7 +245,12 @@ class FpsCheck:
         Returns:
             boolean with truth value dependent on value of get_public_suffix
         """
-        return self.etlds.get_public_suffix(site, strict=True) is not None
+        assert site is not None
+        site = site.removeprefix("https://")
+        is_etldp1_or_etld = self.etlds.get_sld(site, strict=True) == site
+        is_etld = self.etlds.get_tld(site, strict=True) == site
+        return is_etldp1_or_etld and not is_etld
+    
 
     def find_invalid_eTLD_Plus1(self, check_sets):
         """Checks if all domains are etld+1 compliant
@@ -254,7 +259,7 @@ class FpsCheck:
         and appends errors to the error list for any that return false
 
         Args:
-            check_sets: a dictionary of primary->FpsSet
+            check_sets: Dict[string, FpsSet]
         Returns:
             None
         """
@@ -262,36 +267,34 @@ class FpsCheck:
             # Apply to the primary
             if not self.is_eTLD_Plus1(primary):
                 self.error_list.append(
-                    "The provided primary site does not have an eTLD in the" +
-                    " Public suffix list: " + primary)
+                    "The provided primary site is not an eTLD+1: " +
+                    primary)
             # Apply to the country codes
             if check_sets[primary].ccTLDs:
                 for alias in check_sets[primary].ccTLDs:
                     if not self.is_eTLD_Plus1(alias):
                         self.error_list.append(
-                            "The provided alias does not have an eTLD in the "
-                            + "Public suffix list: " + alias)
+                            "The provided alias is not an eTLD+1: " +
+                            alias)
                     for aliased_site in check_sets[primary].ccTLDs[alias]:
                         if not self.is_eTLD_Plus1(aliased_site):
                             self.error_list.append(
-                                "The provided aliased site does not have an "
-                                + "eTLD in the Public suffix list: " + 
-                                aliased_site)
+                                "The provided aliased site is not an eTLD+1: " 
+                                + aliased_site)
             # Apply to associated sites
             if check_sets[primary].associated_sites:
                 for associated_site in check_sets[primary].associated_sites:
                     if not self.is_eTLD_Plus1(associated_site):
                         self.error_list.append(
-                            "The provided associated site does not have an " +
-                            "eTLD in the Public suffix list: " + 
+                            "The provided associated site is not an eTLD+1: " +
                             associated_site)
             # Apply to service sites
             if check_sets[primary].service_sites:
                 for service_site in check_sets[primary].service_sites:
                     if not self.is_eTLD_Plus1(service_site):
                         self.error_list.append(
-                            "The provided service site does not have an eTLD " 
-                            + "in the Public suffix list: " + service_site)
+                            "The provided service site is not an eTLD+1: " + 
+                            service_site)
 
     def open_and_load_json(self, url):
         """Calls urlopen and returns json from a site
@@ -302,7 +305,8 @@ class FpsCheck:
         Args:
             url: a domain that we want to load the json from
         """
-        with urlopen(url) as json_file:
+        req = Request(url=url, headers={'User-Agent': 'Chrome'})
+        with urlopen(req) as json_file:
             return json.load(json_file)
 
     def check_list_sites(self, primary, site_list):
@@ -321,14 +325,14 @@ class FpsCheck:
             None
         """
         for site in site_list:
-            url = site + "/.well-known/first-party-set"
+            url = site + WELL_KNOWN
             try:
                 json_schema = self.open_and_load_json(url)
                 if 'primary' not in json_schema.keys():
                     self.error_list.append(
                         "The listed associated site site did not have primary"
-                        + " as a key in its .well-known/first-party-set file: "
-                        + site)
+                        + " as a key in its .well-known/first-party-set.json "
+                        + "file: " + site)
                 elif json_schema['primary'] != primary:
                     self.error_list.append("The listed associated site "
                     + "did not have " + primary + " listed as its primary: " 
@@ -349,14 +353,14 @@ class FpsCheck:
         format, or its contents do no match what is expected.
 
         Args:
-            check_sets: a dictionary of primary->FpsSet
+            check_sets: Dict[string, FpsSet]
         Returns:
             None
         """
         # Check the schema to ensure consistency
         for primary in check_sets:
             # First we check the primary sites
-            url = primary + "/.well-known/first-party-set"
+            url = primary + WELL_KNOWN
             # Read the well-known files and check them against the schema we 
             # have stored
             try:
@@ -384,7 +388,7 @@ class FpsCheck:
                     if field_sym_difference:
                         self.error_list.append("The following member(s) of " 
                         + field + " were not present in both the changelist "
-                        + "and .well-known/first-party-sets file: " + 
+                        + "and .well-known/first-party-set.json file: " + 
                         str(sorted(field_sym_difference)))
             except Exception as inst:
                 self.error_list.append(
@@ -405,52 +409,73 @@ class FpsCheck:
                 for aliased_site in check_sets[primary].ccTLDs:
                     ccTLD_sites += check_sets[primary].ccTLDs[aliased_site]
                     self.check_list_sites(primary, ccTLD_sites)
+        
+    def find_invalid_removal(self, subtracted_sets):
+        """Checks that any sets being removed were properly removed by owner
+        
+        Checks that the /.well-known page for the primary of any FPS removed
+        from the list returns an error 404.
+        Args:
+            subtracted_sets: Dict[string, FpsSet]
+        Returns:
+            None"""
+        for primary in subtracted_sets:
+            url = primary + WELL_KNOWN
+            try:
+                r = requests.get(url, timeout=10)
+                if r.status_code != 404:
+                    self.error_list.append("The set associated with " + primary
+                            + " was removed from the list, but " + url + 
+                            " does not return error 404.")
+            except Exception as inst:
+                self.error_list.append("Unexpected error when accessing " +
+                                    url + "; Received error:" + str(inst))
 
     def find_invalid_alias_eSLDs(self, check_sets):
         """Checks that eSLDs match their alias, and that country codes are 
         members of icann
         Reads the ccTLDs and makes sure that they match their equivalent sites,
-        and that they're domains are part of ICANNS list of country codes.
-        If either of these is not the case, appends an error to the error_list
+        and that their eTLDs are part of ICANN's list of country codes.
+        If either of these is not the case, appends an error to the error_list.
+        Note: A site may list a variant with "com" as its eTLD IFF the site 
+        being aliased has an eTLD on ICANN's list of countrycodes. 
         Args:
-            check_sets: a dictionary of primary->FpsSet
+            check_sets: Dict[string, FpsSet]
         Returns:
             None
         """
-        for primary in check_sets:
-            curr_set = check_sets[primary]
-            if curr_set.ccTLDs:
-                for aliased_site in curr_set.ccTLDs:
-                    # first check if the aliased site is actually anywhere else
-                    # in the fps
-                    if aliased_site != primary:
-                        if curr_set.associated_sites:
-                            sites = curr_set.associated_sites 
-                        else:
-                            sites = []
-                        if curr_set.service_sites:
-                            sites += curr_set.service_sites
-                        if aliased_site not in sites:
-                            self.error_list.append(
-                                "The aliased site " + aliased_site + 
-                                " contained within the ccTLDs must be a " +
-                                "primary, associated site, or service site " +
-                                "within the firsty pary set for " + primary)
-                    # check the validity of the aliases
-                    aliased_tld = aliased_site.split(".")[0]
-                    plus1s = [(site, site.split(".")[0], site.split(".")[-1])
-                              for site in curr_set.ccTLDs[aliased_site]]
-                    for eSLD in plus1s:
-                        if eSLD[1] != aliased_tld:
-                            self.error_list.append(
-                                "The following top level domain must match: " 
-                                + aliased_site + ", but is instead: " 
-                                + eSLD[0])
-                        if eSLD[2] not in self.icanns:
-                            self.error_list.append(
-                                "The provided country code: " + eSLD[2] + 
-                                ", in: " + eSLD[0] + 
-                                " is not a ICANN registered country code")
+        for primary, curr_set in check_sets.items():
+            if not curr_set.ccTLDs:
+                continue
+            for aliased_site in curr_set.ccTLDs:
+                # first check if the aliased site is actually anywhere else
+                # in the fps
+                if not curr_set.includes(aliased_site, False):
+                    self.error_list.append(
+                        "The aliased site " + aliased_site + 
+                        " contained within the ccTLDs must be a " +
+                        "primary, associated site, or service site " +
+                        "within the firsty pary set for " + primary)
+                # check the validity of the aliases
+                aliased_eSLD, aliased_tld = (aliased_site.split(".")[0],
+                                                aliased_site.split(".")[-1])
+                if aliased_tld in self.icanns:
+                    icann_check = self.icanns.union({"com"})
+                else:
+                    icann_check = self.icanns
+                variants = [(site, site.split(".")[0], site.split(".")[-1])
+                            for site in curr_set.ccTLDs[aliased_site]]
+                for site, eSLD, tld in variants:
+                    if eSLD != aliased_eSLD:
+                        self.error_list.append(
+                            "The following top level domain must match: " 
+                            + aliased_site + ", but is instead: " 
+                            + site)
+                    if tld not in icann_check:
+                        self.error_list.append(
+                            "The provided country code: " + tld + 
+                            ", in: " + site + 
+                            " is not a ICANN registered country code")
 
     def find_robots_txt(self, check_sets):
         """Checks service sites to see if they have a robots.txt subdomain.
@@ -464,30 +489,33 @@ class FpsCheck:
         to the error list.
 
         Args:
-            check_sets: a dictionary of primary->FpsSet
+            check_sets: Dict[string, FpsSet]
         Returns:
             None
         """
         exception_retries = "Max retries exceeded with url: /robots.txt"
         exception_timeout = "Read timed out. (read timeout=10)"
         for primary in check_sets:
+            if not check_sets[primary].service_sites:
+                continue
             for service_site in check_sets[primary].service_sites:
-                robot_site = service_site + "/robots.txt"
                 try:
-                    r = requests.get(robot_site, timeout=10)
-                    if r.status_code == 200:
-                        r_service = requests.get(service_site, timeout=10)
-                        if 'X-Robots-Tag' not in r_service.headers:
+                    r_service = requests.get(service_site, timeout=10)
+                    if 'X-Robots-Tag' not in r_service.headers:
+                        self.error_list.append("The service site " + 
+                        service_site + " does not have an X-Robots-Tag in its "
+                         + "header")
+                    else:
+                        robots_tag = r_service.headers['X-Robots-Tag']
+                        if ':' in robots_tag:
                             self.error_list.append("The service site " + 
-                            service_site + " has a robots.txt file, " + 
-                            "but does not have " + 
-                            "X-Robots-Tag in its header")
-                        else:
-                            if r_service.headers['X-Robots-Tag'] != 'noindex':
-                                self.error_list.append(
-                                    "The service site " + service_site + 
-                                    " has a robots.txt file, but does not have"
-                                    + " a no-index tag in its header")
+                                service_site + " contains an 'X-Robots-Tag' " +
+                                "that does not meet the policy requirements")
+                        elif 'none' not in robots_tag and 'noindex' not in robots_tag:
+                                    self.error_list.append("The service site " 
+                                        + service_site + " does not have a " +
+                                        "'noindex' or 'none' tag in its header"
+                                        )
                 except Exception as inst:
                     if exception_retries not in str(inst):
                         if exception_timeout not in str(inst):
@@ -505,7 +533,7 @@ class FpsCheck:
         does not cause a timeout error. 
 
         Args:
-            check_sets: a dictionary of primary->FpsSet
+            check_sets: Dict[string, FpsSet]
         Returns:
             None
         """
@@ -513,6 +541,8 @@ class FpsCheck:
         exception_retries = "Max retries exceeded with url: /ads.txt"
         exception_timeout = "Read timed out. (read timeout=10)"
         for primary in check_sets:
+            if not check_sets[primary].service_sites:
+                continue
             for service_site in check_sets[primary].service_sites:
                 ads_site = service_site + "/ads.txt"
                 try:
@@ -538,7 +568,7 @@ class FpsCheck:
         error. 
 
         Args:
-            check_sets: a dictionary of primary->FpsSet
+            check_sets: Dict[string, FpsSet]
         Returns:
             None
         """
@@ -546,6 +576,8 @@ class FpsCheck:
         exception_retries = "Max retries exceeded with url: /"
         exception_timeout = "Read timed out. (read timeout=10)"
         for primary in check_sets:
+            if not check_sets[primary].service_sites:
+                continue
             for service_site in check_sets[primary].service_sites:
                 try:
                     r = requests.get(service_site, timeout=10)
